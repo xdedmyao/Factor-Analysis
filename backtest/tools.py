@@ -4,8 +4,7 @@
 """
 import pandas as pd
 import numpy as np
-import glob
-import seaborn as sns
+import os
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from statsmodels.tsa.stattools import acf, adfuller
@@ -15,12 +14,48 @@ from tabulate import tabulate
 import warnings
 warnings.filterwarnings('ignore')
 
+DAILY_PATH = '../data/data_daily/'
 DATES_PATH = '../data/dates/trading_dates.parquet'
-DAILY_PATH = '../data/data_daily/daily.parquet'
 BASIC_INFO_PATH = '../data/stock_info/stock_info.parquet'
 INDUSTRY_INFO = '../data/industry/sw_industry_info.parquet'
 SHARE_PATH = '../data/shares/shares.parquet'
     
+def get_daily_data(start_date:str, end_date:str, mode = 'filter'):
+    """
+    获取给定日期区间的股票日线数据
+    
+    Args:
+    - start_date
+    - end_date
+    
+    Return:
+    - pd.DataFrame
+    
+    """
+    if start_date > end_date:
+        return None
+    
+    # 获取目录下所有 .parquet 文件
+    parquet_files = [f for f in os.listdir(DAILY_PATH) if f.endswith('.parquet')]
+
+    # 读取并合并所有 parquet 文件
+    df_list = []
+    for file in parquet_files:
+        if file[:4] >= start_date[:4] and file[:4] <= end_date[:4]:
+            file_path = os.path.join(DAILY_PATH, file)
+            df = pd.read_parquet(file_path)
+            df_list.append(df)
+
+    # 合并所有 DataFrame
+    combined_df = pd.concat(df_list, ignore_index=True)
+    result = combined_df[(combined_df.date >= start_date) & (combined_df.date <= end_date)].reset_index(drop = True)
+
+    # 剔除非交易日以及停牌的股票
+    if mode == 'filter':
+        result = result[result['trading_status'] == 0].reset_index(drop=True)
+
+    return result.sort_values(by=['date', 'stock_code']).reset_index(drop=True)
+
 def trading_date_offset(date:str, offset=1):
     """
     给定日期, 找到距离该日期前offset个交易日的日期(默认偏移为1)
@@ -84,53 +119,6 @@ def trading_dates(start_date:str, end_date:str):
             break
     
     return valid_dates[start_index:end_index]
-
-def get_daily_data(start_date:str, end_date:str):
-    """
-    获取给定日期区间的股票日线数据(剔除上市不满一年、涨跌停的股票)
-    
-    Args:
-    - start_date
-    - end_date
-    
-    Return:
-    - pd.DataFrame(Columns: stock_code, date, open, close, high, low, volume, money, mcap, prev_close)
-    
-    """
-    if start_date > end_date:
-        return None
-    
-    def filter_stocks(df:pd.DataFrame):
-        """
-        剔除上市不满一年的股票
-        
-        Args:
-        - df: pd.DataFrame(Columns: stock_code,exchange,date,open,close,high,low,volume,money)
-                
-        Return:
-        - pd.DataFrame(Columns: stock_code,exchange,date,open,close,high,low,volume,money)
-        """
-        stock_info = pd.read_parquet(BASIC_INFO_PATH)
-
-        # 转换成日期格式
-        df.date = pd.to_datetime(df.date)
-        stock_info.list_date = pd.to_datetime(stock_info.list_date)
-
-        # 计算上市天数
-        merge_df = pd.merge(df, stock_info, on = ['stock_code'],how = 'left')
-        merge_df['days_listed'] = (merge_df['date'] - merge_df['list_date']).dt.days
-
-        # 剔除上市不满365天
-        df_filtered = merge_df[merge_df['days_listed'] >= 365]
-
-        return df_filtered.drop(columns=['short_name']).reset_index(drop=True)
-
-    result = pd.read_parquet(DAILY_PATH)
-    # 剔除停牌的股票
-
-    result = result[result['trading_status'] == 0].reset_index(drop=True)
-    result = result[(result.date >= start_date) & (result.date <= end_date)].reset_index(drop = True)
-    return filter_stocks(result)
 
 def get_shares(start_date:str, end_date:str):
     """
@@ -461,13 +449,14 @@ def factor_backtest(df: pd.DataFrame,
         group_returns = df.groupby(['date', 'group'])['return_adjusted'].mean().unstack()
         all_groups = list(range(1, num_groups + 1))
         group_returns = group_returns.reindex(columns=all_groups).fillna(0)
-        group_returns['IC'] = ic
         
         # 若 IC 为负则反转分组标签
         if direction < 0:
             reversed_cols = list(range(num_groups, 0, -1))
             group_returns.columns = reversed_cols
-            
+
+        group_returns['IC'] = ic
+  
         # 指标计算
         result = pd.DataFrame(index=['value'])
         result['IC'] = round(ic.mean(), 3)
@@ -612,7 +601,7 @@ def factor_backtest(df: pd.DataFrame,
 
 ################################## 子图 5: IC 时间序列图 (第三行右) ################################################
 
-        print('Process:因子IC分析...')
+        print('Process: 因子IC分析...')
         ax5 = fig.add_subplot(gs[2, 1])
         colors = ['#1f77b4' if v >= 0 else '#d62728' for v in ic]
         ax5.bar(ic.index, ic.values, 
@@ -687,7 +676,7 @@ def factor_backtest(df: pd.DataFrame,
                 curr_stocks = set(top_group[top_group['date'] == curr_date]['stock_code'])
                 turnover_stocks = prev_stocks.symmetric_difference(curr_stocks)
                 if len(curr_stocks) > 0:
-                    turnover_rate = len(turnover_stocks) / (2 * len(curr_stocks))
+                    turnover_rate = len(turnover_stocks) / (2 * len(prev_stocks))
                     turnover_ts[curr_date] = turnover_rate
                 else:
                     turnover_ts[curr_date] = 0.0
@@ -717,7 +706,7 @@ def factor_backtest(df: pd.DataFrame,
 #####################################  生成结果  ################################################
 
     # 生成分组回测结果
-    print('Process:因子分层回测...')
+    print('Process: 因子分层回测...')
     result, group_returns, ic = backtest(merge_df, 
                                         factor_name=factor_name, 
                                         num_groups=group, 

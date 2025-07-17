@@ -1,1 +1,3 @@
-# Cross-sectional Factor Analysis
+## 股票因子截面分析框架
+### 目前支持所有A股(剔除ST) 2018.01.01 - 2025.06.30的日频数据（后复权）
+### 使用示例请见generate_factor.ipynb
