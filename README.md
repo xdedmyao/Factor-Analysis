@@ -1,1 +1,1 @@
-# -
+# Cross-sectional Factor Analysis
