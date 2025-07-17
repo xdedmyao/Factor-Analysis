@@ -5,6 +5,7 @@
 import pandas as pd
 import numpy as np
 import os
+import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from statsmodels.tsa.stattools import acf, adfuller
@@ -485,11 +486,11 @@ def factor_backtest(df: pd.DataFrame,
 
 ##################################### 绘图函数 ###############################################################
     
-    def plot_all_charts(result, group_returns, ic, df, factor_name, num_groups, width=15, height=23):
+    def plot_all_charts(result, group_returns, ic, df, factor_name, num_groups, width=15, height=28):
         
         # 创建 4x2 网格的 GridSpec
         fig = plt.figure(figsize=(width, height))
-        gs = gridspec.GridSpec(4, 2, height_ratios=[1, 1.5, 1, 1])
+        gs = gridspec.GridSpec(5, 2, height_ratios=[1, 1.5, 1, 1, 1])
         fig.suptitle(f'Factor Analysis: {factor_name}', fontsize=20, weight='bold')
 
 ##################################### 子图 1: 分组因子均值和日度收益(第一行左) ################################################
@@ -622,7 +623,7 @@ def factor_backtest(df: pd.DataFrame,
         lines2, labels2 = ax5_twin.get_legend_handles_labels()
         ax5.legend(lines1 + lines2, labels1 + labels2, 
                    loc='upper right', fontsize=10)
-        ax5.set_xticks(ic.index[::40])
+        ax5.set_xticks(ic.index[::x_ticks_interval])
         ax5.tick_params(axis='x', rotation=45, labelsize=10)
         ax5.set_title('IC Series with Cumulative Sum', fontsize=15)
         ax5.set_ylabel('IC Value', fontsize=12)
@@ -657,7 +658,33 @@ def factor_backtest(df: pd.DataFrame,
         ax6.set_ylabel('IC Mean', fontsize=12)
         ax6.grid(axis='y', alpha=0.4, linestyle='--')
 
-##################################### 子图 7: 换手率图 (第四行右) ################################################
+##################################### 子图 7: IC分年月热力图 (第四行右) ################################################
+
+        ax7 = fig.add_subplot(gs[3, 1])
+        # 提取年份和月份
+        tmp_df = group_returns.copy()
+        tmp_df['year'] = tmp_df.index.year
+        tmp_df['month'] = tmp_df.index.month
+
+        # 按年份和月份计算 ic 均值
+        pivot_table = tmp_df.pivot_table(values='IC', index='year', columns='month', aggfunc='mean')
+        pivot_table = pivot_table.round(3)
+
+        sns.heatmap(
+            pivot_table,
+            annot=True,  # 显示格子中的数值
+            fmt='.3f',   # 保留3位小数
+            cmap='coolwarm',  # 颜色从红到绿（低到高）
+            cbar_kws={'label': 'IC Mean'},  # 颜色条标签
+            ax = ax7
+        )
+
+        # 设置标题和标签
+        ax7.set_title('IC Mean by Year and Month', fontsize=15)
+        ax7.set_xlabel('Month', fontsize=12)
+        ax7.set_ylabel('Year', fontsize=12)
+
+##################################### 子图 8: 换手率图 (第五行左) ################################################
 
         print('Process: 因子换手率分析...')
 
@@ -687,18 +714,81 @@ def factor_backtest(df: pd.DataFrame,
         turnover_ts = factor_turnover(df)
         result['turnover']  = turnover_ts.mean()
 
-        ax7 = fig.add_subplot(gs[3, 1])
-        ax7.plot(turnover_ts, label=f'Turnover (Mean: {turnover_ts.mean():.2f})')
-        ax7.set_xticks(turnover_ts.index[::x_ticks_interval])
-        ax7.tick_params(axis='x', rotation=45)
-        ax7.set_title('Long Group Turnover', fontsize=15)
-        ax7.set_ylabel('Turnover Rate', fontsize=12)
-        ax7.legend(loc='upper left', frameon=False, fontsize=10)
-        ax7.grid(True, linestyle=':', alpha=0.7)
+        ax8 = fig.add_subplot(gs[4, 0])
+        ax8.plot(turnover_ts, label=f'Turnover (Mean: {turnover_ts.mean():.2f})')
+        ax8.set_xticks(turnover_ts.index[::x_ticks_interval])
+        ax8.tick_params(axis='x', rotation=45)
+        ax8.set_title('Long Group Turnover', fontsize=15)
+        ax8.set_ylabel('Turnover Rate', fontsize=12)
+        ax8.legend(loc='upper left', frameon=False, fontsize=10)
+        ax8.grid(True, linestyle=':', alpha=0.7)
+        group_returns['turnover'] = turnover_ts
+
+##################################### 子图 9: 年度绩效表格 (第五行右) ################################################
+        
+        ax9 = fig.add_subplot(gs[4, 1])  
+        ax9.axis('off')  
+
+        tmp_df = group_returns.copy()
+        tmp_df['year'] = tmp_df.index.year
+
+        years = tmp_df['year'].unique()
+        results = {
+            'year': [],
+            'turnover': [],
+            'mean_ic': [],
+            'icir': [],
+            'long_ret': [],
+            'long_sharpe': [],
+            'long_mdd': []
+        }
+
+        for year in years:
+            yearly_data = tmp_df[tmp_df['year'] == year]
+            turnover = yearly_data['turnover'].mean()
+            mean_ic = yearly_data['IC'].mean()
+            icir = mean_ic / yearly_data['IC'].std() if yearly_data['IC'].std() != 0 else np.nan
+            daily_returns = yearly_data[5]
+            mean_ret = daily_returns.mean()
+            annual_vol = daily_returns.std() * np.sqrt(252)
+            sharpe = mean_ret * 252 / annual_vol if annual_vol != 0 else np.nan
+            cum_returns = (1 + daily_returns).cumprod()
+            drawdowns = (cum_returns - cum_returns.cummax()) / cum_returns.cummax()
+            mdd = drawdowns.min() if not drawdowns.empty else np.nan
+        
+            results['year'].append(year)
+            results['turnover'].append(turnover)
+            results['mean_ic'].append(mean_ic)
+            results['icir'].append(icir)
+            results['long_ret'].append(mean_ret)
+            results['long_sharpe'].append(sharpe)
+            results['long_mdd'].append(mdd)
+
+        results_df = pd.DataFrame(results)
+        results_df = results_df.round(4)
+        results_df = results_df.sort_values('year')
+
+        table_data = results_df.values
+        col_labels = ['Year', 'Turnover', 'Mean IC', 'ICIR', 'Long Ret', 'Long Sharpe', 'Long MDD']
+        formatted_data = []
+        for row in table_data:
+            formatted_row = [f"{int(row[0]):d}"] + [f"{x:.4f}" if not np.isnan(x) else 'NaN' for x in row[1:]]
+            formatted_data.append(formatted_row)
+
+        table = ax9.table(cellText=formatted_data,
+                        colLabels=col_labels,
+                        cellLoc='center',
+                        loc='center',
+                        colColours=["#d4d4d4"] * len(col_labels))  
+
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1.2, 1.2)  
+        ax9.set_title('Annual Portfolio Metrics', fontsize=15, pad=20)
 
         # 调整布局
         print('Finished')
-        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        fig.tight_layout(rect=[0, 0, 1, 0.98])
         plt.show()
 
         return result
