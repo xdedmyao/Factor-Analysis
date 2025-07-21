@@ -15,12 +15,11 @@ from tabulate import tabulate
 import warnings
 warnings.filterwarnings('ignore')
 
-DAILY_PATH = '../data/data_daily/'
+DAILY_PATH = './data/data_daily/'
+RET_PATH = './data/data_ret/'
 DATES_PATH = '../data/dates/trading_dates.parquet'
 BASIC_INFO_PATH = '../data/stock_info/stock_info.parquet'
-INDUSTRY_INFO = '../data/industry/sw_industry_info.parquet'
-SHARE_PATH = '../data/shares/shares.parquet'
-    
+
 def get_daily_data(start_date:str, end_date:str, mode = 'filter'):
     """
     获取给定日期区间的股票日线数据
@@ -121,22 +120,6 @@ def trading_dates(start_date:str, end_date:str):
     
     return valid_dates[start_index:end_index]
 
-def get_shares(start_date:str, end_date:str):
-    """
-    获取指定时间短内所有A股流通股本数据
-    
-    Args:
-   
-    - start_date
-    - end_date
-    
-    Return:
-    - pd.DataFrame(包含stock_code, date, shares)
-    
-    """
-    result = pd.read_parquet(SHARE_PATH)
-    return result[(result.date >= start_date) & (result.date <= end_date)].reset_index(drop=True)
-
 def Factor_Processing(df, factor_name, neutralization=False, zscore=True, cut_extreme = True):
 
     def factor_mad_cut_extreme(df:pd.DataFrame, factor_name="factor_value", k=3):
@@ -167,7 +150,7 @@ def Factor_Processing(df, factor_name, neutralization=False, zscore=True, cut_ex
 
     def factor_neutralize(df: pd.DataFrame, factor_name="factor_value"):
         """
-        对每个交易日的横截面数据进行市值+行业中性化处理，返回中性化后的因子残差。
+        对每个交易日的横截面数据进行市值中性化处理，返回中性化后的因子残差。
         
         Args:
         - df: 输入 DataFrame, 需包含股票代码、日期、因子值
@@ -179,12 +162,12 @@ def Factor_Processing(df, factor_name, neutralization=False, zscore=True, cut_ex
                                     factor_col: str = 'factor_value',
                                     date_col: str = 'date',
                                     code_col: str = 'stock_code',
-                                    cap_col: str = 'float_mcap',
-                                    industry_col: str = 'industry_code',
+                                    cap_col: str = 'floating_market_cap',
+                                    # industry_col: str = 'industry_code',
                                     log_cap: bool = True) -> pd.DataFrame:
             df = df.copy()
-            df = df.dropna(subset=[factor_col, cap_col, industry_col])  # 删除缺失值
-            df[industry_col] = df[industry_col].astype(str)
+            df = df.dropna(subset=[factor_col, cap_col])  # 删除缺失值
+            # df[industry_col] = df[industry_col].astype(str)
             
             neutralized = []
             for date, group in tqdm(df.groupby(date_col), desc='Processing Date:'):
@@ -205,9 +188,9 @@ def Factor_Processing(df, factor_name, neutralization=False, zscore=True, cut_ex
                 
                 # 行业中性化
                 # 添加行业哑变量
-                if group[industry_col].nunique() > 1:
-                    industry_dummies = pd.get_dummies(group[industry_col], prefix='industry', drop_first=True)
-                    X = pd.concat([X, industry_dummies], axis=1)
+                # if group[industry_col].nunique() > 1:
+                #     industry_dummies = pd.get_dummies(group[industry_col], prefix='industry', drop_first=True)
+                #     X = pd.concat([X, industry_dummies], axis=1)
                 
                 X = sm.add_constant(X)
                 X = X.astype(float)
@@ -225,13 +208,17 @@ def Factor_Processing(df, factor_name, neutralization=False, zscore=True, cut_ex
             return df[[code_col, date_col, factor_col]]
         
         # 合并行业数据
-        industry_df = pd.read_parquet(INDUSTRY_INFO)[['stock_code', 'industry_code']]
-        merged_df = pd.merge(df, industry_df, on=['stock_code'], how='left')
+        # industry_df = pd.read_parquet(INDUSTRY_INFO)[['stock_code', 'industry_code']]
+        # merged_df = pd.merge(df, industry_df, on=['stock_code'], how='left')
         
+
+        # 合并市值数据
+        mcap_df = get_daily_data(str(df.date.min())[:10], str(df.date.max())[:10])[['date','stock_code','floating_market_cap']]
+        merged_df = pd.merge(df, mcap_df, on=['stock_code', 'date'], how='left')
         # 中性化
         neutralized_df = cross_sectional_neutralize(merged_df, factor_col = factor_name)
         
-        return neutralized_df
+        return neutralized_df.sort_values(by=['date', 'stock_code']).reset_index(drop=True)
 
     def factor_zscore(df:pd.DataFrame, fill_method='zero', factor_name="factor_value"):
         """
@@ -279,7 +266,7 @@ def Factor_Processing(df, factor_name, neutralization=False, zscore=True, cut_ex
         # 计算 Z-Score
         df[factor_name] = (df[factor_name] - mean) / std
         
-        return df[['stock_code', 'date', factor_name]]
+        return df[['stock_code', 'date', factor_name]].sort_values(by=['date', 'stock_code']).reset_index(drop=True)
     
     print('Process: 因子预处理...')
     result_df = df.copy()
@@ -288,7 +275,7 @@ def Factor_Processing(df, factor_name, neutralization=False, zscore=True, cut_ex
         result_df = factor_mad_cut_extreme(result_df, factor_name = factor_name)
     
     if neutralization == True:
-        print('Process: 因子中性化')
+        print('Process: 因子中性化...')
         result_df = factor_neutralize(result_df, factor_name = factor_name)
 
     if zscore == True:
@@ -424,17 +411,17 @@ def factor_backtest(df: pd.DataFrame,
                         cut_extreme=cut_extreme)
 
 ##################################### 合并收益率信息 ########################################################
-    ret = get_daily_data(start_date, end_date)[['stock_code', 'date', 'close']]
-    ret['return'] = ret.groupby('stock_code')['close'].pct_change().fillna(0)
-    ret = ret.drop(columns=['close'])
+    ret_path = RET_PATH + 'stock_daily_ret_2018-2025.parquet'
+    ret = pd.read_parquet(ret_path)
     ret['date'] = pd.to_datetime(ret['date'])
-    merge_df = pd.merge(ret, df, on=['stock_code', 'date'], how='left')
-
+    merge_df = pd.merge(df, ret, on=['stock_code', 'date'], how='left')
+    # 剔除涨跌停股票
+    merge_df = merge_df[merge_df['limit_status'] == 0].reset_index(drop=True)
 ##################################### 因子回测计算函数 #######################################################
     
-    def backtest(df, factor_name, direction, num_groups=5, lag_days=1):
+    def backtest(df, factor_name, direction, num_groups=5, lag_days=2):
         df = df.sort_values(['date', 'stock_code']).copy()
-
+        # print(df)
         # 计算滞后收益率
         df['return_adjusted'] = df.groupby('stock_code')['return'].shift(-lag_days)
         df = df.dropna(subset=['return_adjusted'])
@@ -802,7 +789,6 @@ def factor_backtest(df: pd.DataFrame,
                                         num_groups=group, 
                                         lag_days=lag_days, 
                                         direction=direction)
-    
     # 绘制所有图表
     result = plot_all_charts(result, group_returns, ic, merge_df, factor_name, group)
 
