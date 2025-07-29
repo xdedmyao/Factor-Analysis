@@ -4,6 +4,7 @@
 """
 import pandas as pd
 import numpy as np
+import re
 import os
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -16,9 +17,9 @@ import warnings
 warnings.filterwarnings('ignore')
 
 DAILY_PATH = './data/data_daily/'
-RET_PATH = './data/data_ret/'
+RET_PATH = './data/data_excess_ret/'
+BARRA_PATH = './data/data_barra/'
 DATES_PATH = '../data/dates/trading_dates.parquet'
-BASIC_INFO_PATH = '../data/stock_info/stock_info.parquet'
 
 def get_daily_data(start_date:str, end_date:str, mode = 'filter'):
     """
@@ -205,16 +206,12 @@ def Factor_Processing(df, factor_name, neutralization=False, zscore=True, cut_ex
             
             neutralized_series = pd.concat(neutralized).reindex(df.index)
             df[factor_col] = neutralized_series
-            return df[[code_col, date_col, factor_col]]
+            return df
         
-        # 合并行业数据
-        # industry_df = pd.read_parquet(INDUSTRY_INFO)[['stock_code', 'industry_code']]
-        # merged_df = pd.merge(df, industry_df, on=['stock_code'], how='left')
-        
-
         # 合并市值数据
         mcap_df = get_daily_data(str(df.date.min())[:10], str(df.date.max())[:10])[['date','stock_code','floating_market_cap']]
         merged_df = pd.merge(df, mcap_df, on=['stock_code', 'date'], how='left')
+        
         # 中性化
         neutralized_df = cross_sectional_neutralize(merged_df, factor_col = factor_name)
         
@@ -266,21 +263,22 @@ def Factor_Processing(df, factor_name, neutralization=False, zscore=True, cut_ex
         # 计算 Z-Score
         df[factor_name] = (df[factor_name] - mean) / std
         
-        return df[['stock_code', 'date', factor_name]].sort_values(by=['date', 'stock_code']).reset_index(drop=True)
+        return df.sort_values(by=['date', 'stock_code']).reset_index(drop=True)
     
     print('Process: 因子预处理...')
     result_df = df.copy()
+    
     if cut_extreme == True:
         print('Process: 因子截面MAD去极值...')
         result_df = factor_mad_cut_extreme(result_df, factor_name = factor_name)
     
-    if neutralization == True:
-        print('Process: 因子中性化...')
-        result_df = factor_neutralize(result_df, factor_name = factor_name)
-
     if zscore == True:
         print('Process: 因子Zscore标准化...')
         result_df = factor_zscore(result_df, factor_name = factor_name)
+
+    if neutralization == True:
+        print('Process: 因子中性化...')
+        result_df = factor_neutralize(result_df, factor_name = factor_name)
 
     return result_df
     
@@ -368,31 +366,33 @@ def factor_rank_autocorrelation(df:pd.DataFrame):
     print(f"\n平稳股票数量: {stationary_count}/{total_valid} ({stationary_count/total_valid:.2%})")
     return result
 
-def factor_backtest(df: pd.DataFrame, 
-                    factor_name: str,  
-                    start_date: str,  
-                    end_date: str,    
-                    lag_days: int = 2, 
-                    direction: int = 1,     
-                    group: int = 5,         
-                    neutralization = False, 
-                    zscore = True,
-                    cut_extreme = True): 
+def factor_backtest(df: pd.DataFrame, # 因子文件
+                    factor_name: str, # 因子名称
+                    start_date: str,  # 开始日期
+                    end_date: str,    # 结束日期
+                    direction: int = 1,# 因子方向(默认为正向)     
+                    group: int = 5,   # 因子分组数       
+                    neutralization = False, # 市值，行业中性化选项
+                    zscore = True, # 因子标准化选项
+                    cut_extreme = True, # 是否剔除极端值
+                    ret_mode = 'ret', # 收益率计算方式('ret'绝对收益 or 'excess_ret'超额收益)
+                    pool = 'market'): # 票池选择('csi1000' or 'csi300' or 'csi500'), 默认market
     """
-    因子分组回测函数，合并所有图表到一张大图
+    因子分组回测函数，合并所有图表到一张大图(年化无风险利率为5%)
     
     Args:
-    - df: pd.DataFrame, 包含 stock_code, date, factor_value 三列
+    - df: pd.DataFrame, 因子文件，包含 stock_code, date, factor_value 三列
     - factor_name: str, 因子名称
     - start_date: str,  开始日期
     - end_date: str,    结束日期
-    - lag_days: int,    使用滞后多少天的收益率
     - direction: int,   因子方向(默认为正向)
     - group: int,       分组数量，默认 5
     - neutralization: bool, 市值，行业中性化选项
     - zscore: bool,     标准化选项
     - cut_extreme: bool,截面MAD去极值选项
-            
+    - ret_mode: str, 收益率计算方式('ret'绝对收益 or 'excess_ret'超额收益)
+    - pool: str, 票池选择('csi1000' or 'csi300' or 'csi500'), 默认market
+
     Return:
     - result: pd.DataFrame
     - cumulative_return: pd.DataFrame
@@ -403,48 +403,97 @@ def factor_backtest(df: pd.DataFrame,
         print('Factor name does not exist')
         return
     
-##################################### 因子预处理 ################################################
-    df = Factor_Processing(df, 
-                        factor_name = factor_name, 
-                        neutralization=neutralization, 
-                        zscore=zscore,
-                        cut_extreme=cut_extreme)
+    df = df[(df.date >= start_date) & (df.date <= end_date)].reset_index(drop=True)    
 
 ##################################### 合并收益率信息 ########################################################
-    ret_path = RET_PATH + 'stock_daily_ret_2018-2025.parquet'
-    ret = pd.read_parquet(ret_path)
-    ret['date'] = pd.to_datetime(ret['date'])
-    merge_df = pd.merge(df, ret, on=['stock_code', 'date'], how='left')
-    # 剔除涨跌停股票
-    merge_df = merge_df[merge_df['limit_status'] == 0].reset_index(drop=True)
+
+    # 合并收益率数据和barra因子数据
+    start_year = start_date[:4]
+    end_year = end_date[:4]
+    ret_df = pd.DataFrame()
+    barra_df = pd.DataFrame()
+    for year in range(int(start_year), int(end_year) + 1):
+        ret_df = pd.concat([ret_df, 
+                            pd.read_parquet(os.path.join(RET_PATH, f'ret_{year}.parquet'))],
+                           ignore_index=True)
+        barra_df = pd.concat([barra_df, 
+                            pd.read_parquet(os.path.join(BARRA_PATH, f'barra_factor_{year}.parquet'))],
+                            ignore_index=True)
+        
+    ret_df = ret_df[(ret_df['date'] >= start_date) & (ret_df['date'] <= end_date)].reset_index(drop=True)
+    barra_df = barra_df[(barra_df['date'] >= start_date) & (barra_df['date'] <= end_date)].reset_index(drop=True)
+    ret_df['date'] = pd.to_datetime(ret_df['date'])
+    barra_df['date'] = pd.to_datetime(barra_df['date'])
+    merge_df = pd.merge(ret_df, barra_df, on=['date','instrument'], how='left')
+    merge_df = pd.merge(merge_df, df, on=['stock_code', 'date'], how='left')
+
+    if pool != 'market':
+        merge_df = merge_df[merge_df.benchmark_name == pool].copy()
+
+##################################### 因子预处理 ################################################
+
+    merge_df = Factor_Processing(merge_df, 
+                                factor_name = factor_name, 
+                                neutralization=neutralization, 
+                                zscore=zscore,
+                                cut_extreme=cut_extreme)
+    
 ##################################### 因子回测计算函数 #######################################################
     
-    def backtest(df, factor_name, direction, num_groups=5, lag_days=2):
-        df = df.sort_values(['date', 'stock_code']).copy()
-        # print(df)
-        # 计算滞后收益率
-        df['return_adjusted'] = df.groupby('stock_code')['return'].shift(-lag_days)
-        df = df.dropna(subset=['return_adjusted'])
-        df['group'] = df.groupby('date')[factor_name].transform(
-            lambda x: pd.qcut(x, num_groups, labels=False, duplicates='drop') + 1)
+    def backtest(df, 
+                 factor_name, 
+                 direction, 
+                 num_groups=5, 
+                 ret_mode = 'ret',
+                 pool = 'market' # 票池选择('csi1000' or 'csi300' or 'csi500')
+                 ):
         
-        # 计算 IC
-        ic = df.groupby('date').apply(
-            lambda x: x[factor_name].corr(x['return_adjusted'], method='pearson')
-        )
+        df = df.sort_values(['date', 'stock_code']).copy()
 
-        # 分组计算收益
-        group_returns = df.groupby(['date', 'group'])['return_adjusted'].mean().unstack()
+        if ret_mode == 'ret':
+
+            # 计算分组
+            df['group'] = df.groupby('date')[factor_name].transform(
+                lambda x: pd.qcut(x, num_groups, labels=False, duplicates='drop') + 1)
+        
+            # 计算 IC
+            ic = df.groupby('date').apply(
+                lambda x: x[factor_name].corr(x[f'ret'], method='spearman')
+            )
+
+            # 分组计算收益
+            group_returns = df.groupby(['date', 'group'])['ret'].mean().unstack()
+
+        elif ret_mode == 'excess_ret':
+            # 计算分组  
+            df['group'] = df.groupby('date')[factor_name].transform(
+                lambda x: pd.qcut(x, num_groups, labels=False, duplicates='drop') + 1)
+            # 计算 IC
+            if pool == 'market':
+                ic = df.groupby('date').apply(lambda x: x[factor_name].corr(x['alpha_market'], method='spearman'))
+                group_returns = df.groupby(['date', 'group'])['alpha_market'].mean().unstack()
+            elif pool == 'csi1000':
+                ic = df.groupby('date').apply(lambda x: x[factor_name].corr(x[f'alpha_1000'], method='pearson'))
+                group_returns = df.groupby(['date', 'group'])[f'alpha_1000'].mean().unstack()
+            elif pool == 'csi500':
+                ic = df.groupby('date').apply(lambda x: x[factor_name].corr(x[f'alpha_500'], method='pearson'))
+                group_returns = df.groupby(['date', 'group'])[f'alpha_500'].mean().unstack()
+            elif pool == 'csi300':
+                ic = df.groupby('date').apply(lambda x: x[factor_name].corr(x[f'alpha_300'], method='pearson'))
+                group_returns = df.groupby(['date', 'group'])[f'alpha_300'].mean().unstack()
+            else:
+                raise ValueError("Invalid ret_mode or pool combination.")
+            
         all_groups = list(range(1, num_groups + 1))
         group_returns = group_returns.reindex(columns=all_groups).fillna(0)
-        
+       
         # 若 IC 为负则反转分组标签
         if direction < 0:
             reversed_cols = list(range(num_groups, 0, -1))
             group_returns.columns = reversed_cols
 
         group_returns['IC'] = ic
-  
+
         # 指标计算
         result = pd.DataFrame(index=['value'])
         result['IC'] = round(ic.mean(), 3)
@@ -463,21 +512,30 @@ def factor_backtest(df: pd.DataFrame,
         annual_return_long_short = group_returns.long_short.mean() * 252
         result['Long Annual Return'] = round(annual_return_long, 3)
         result['Long Max Drawdown'] = round(((cu_returns[num_groups].cummax() - cu_returns[num_groups]) / cu_returns[num_groups].cummax()).max(), 3)
-        result['Long Sharpe'] = round((group_returns[num_groups].mean() * 252 - 0.1) / (group_returns[num_groups].std() * np.sqrt(252)), 3)
+        result['Long Sharpe'] = round((group_returns[num_groups].mean() * 252 - 0.03) / (group_returns[num_groups].std() * np.sqrt(252)), 3)
         result['Short Max Drawdown'] = round(((cu_returns[1].cummax() - cu_returns[1]) / cu_returns[1].cummax()).max(), 3)
-        result['Short Sharpe'] = round((group_returns[1].mean() * 252 - 0.1) / (group_returns[1].std() * np.sqrt(252)), 3)
+        result['Short Sharpe'] = round((group_returns[1].mean() * 252 - 0.03) / (group_returns[1].std() * np.sqrt(252)), 3)
         result['LS Annual Return'] = round(annual_return_long_short, 3)
         result['LS Max Drawdawn'] = round(((cu_returns['long_short'].cummax() - cu_returns['long_short']) / cu_returns['long_short'].cummax()).max(), 3)
-        result['LS Sharpe'] = round((group_returns.long_short.mean() * 252 - 0.1) / (group_returns.long_short.std() * np.sqrt(252)), 3)
+        result['LS Sharpe'] = round((group_returns.long_short.mean() * 252 - 0.03) / (group_returns.long_short.std() * np.sqrt(252)), 3)
         return result, group_returns, ic
 
 ##################################### 绘图函数 ###############################################################
     
-    def plot_all_charts(result, group_returns, ic, df, factor_name, num_groups, width=15, height=28):
+    def plot_all_charts(result, 
+                        group_returns, 
+                        ic, 
+                        df, 
+                        factor_name, 
+                        num_groups, 
+                        width=15, 
+                        height=32,
+                        ret_mode = ret_mode,
+                        pool = pool):
         
         # 创建 4x2 网格的 GridSpec
         fig = plt.figure(figsize=(width, height))
-        gs = gridspec.GridSpec(5, 2, height_ratios=[1, 1.5, 1, 1, 1])
+        gs = gridspec.GridSpec(6, 2, height_ratios=[1, 1.5, 1, 1, 1, 1.2])
         fig.suptitle(f'Factor Analysis: {factor_name}', fontsize=20, weight='bold')
 
 ##################################### 子图 1: 分组因子均值和日度收益(第一行左) ################################################
@@ -509,7 +567,9 @@ def factor_backtest(df: pd.DataFrame,
         ax2 = fig.add_subplot(gs[0, 1])
         x_ticks_interval = len(group_returns.index) // 20
         df_dropna = df.copy().dropna()
+        
         num_stocks = df_dropna.groupby('date')['stock_code'].count()
+        
         ax2.plot(num_stocks, )
         ax2.set_xticks(num_stocks.index[::x_ticks_interval])
         ax2.tick_params(axis='x', rotation=45)
@@ -620,12 +680,20 @@ def factor_backtest(df: pd.DataFrame,
 
         ax6 = fig.add_subplot(gs[3, 0])
         decay_result = []
-        for days in range(1, 11):
-            tmp_df = df.copy()
-            tmp_df['return_shifted'] = tmp_df.groupby('stock_code')['return'].shift(-days)
+        for days in tqdm(range(1, 11), desc="Process: 因子衰减分析..."):
+            tmp_df = df.copy().sort_values(by = ['date', 'instrument'])
+            if ret_mode == 'ret':
+                tmp_df[f'return_shifted'] = tmp_df.groupby('instrument')['ret'].transform(lambda x:x.rolling(window=days, min_periods=1).sum().shift(-days+1))
+            elif ret_mode == 'excess_ret' and pool == 'market':
+                tmp_df[f'return_shifted'] = tmp_df.groupby('instrument')['alpha_market'].transform(lambda x:x.rolling(window=days, min_periods=1).sum().shift(-days+1))
+            elif ret_mode == 'excess_ret' and pool != 'market':
+                tmp_df[f'return_shifted'] = tmp_df.groupby('instrument')[f'alpha_{re.findall(r'\d+', pool)[0]}'].transform(lambda x:x.rolling(window=days, min_periods=1).sum().shift(-days+1))
+            else:
+                raise ValueError("Invalid ret_mode or pool combination.")
+            
             tmp_df = tmp_df.dropna(subset=['return_shifted'])
             ic = tmp_df.groupby('date').apply(
-                lambda x: x[factor_name].corr(x['return_shifted'], method='pearson')
+                lambda x: x[factor_name].corr(x['return_shifted'], method='spearman')
             )
             decay_result.append(ic.mean())
         
@@ -676,21 +744,23 @@ def factor_backtest(df: pd.DataFrame,
         print('Process: 因子换手率分析...')
 
         def factor_turnover(df, factor_col=factor_name, group_num=num_groups):
-            def rank_and_group(group):
-                group['rank'] = pd.qcut(group[factor_col], q=group_num, labels=False, duplicates='drop')
-                return group
-            df = df.groupby('date').apply(rank_and_group).reset_index(drop=True)
-            top_group = df[df['rank'] == 0][['date', 'stock_code']].copy()
+            df = df.copy()
+            df['group'] = df.groupby('date')[factor_name].transform(
+                lambda x: pd.qcut(x, num_groups, labels=False, duplicates='drop') + 1)
+            top_group = df[df['group'] == 1].sort_values(by=['date','stock_code'])[['date', 'stock_code']].copy()
             dates = top_group['date'].unique()
             turnover_ts = {}
             for i in range(1, len(dates)):
                 prev_date = dates[i-1]
+                
                 curr_date = dates[i]
                 prev_stocks = set(top_group[top_group['date'] == prev_date]['stock_code'])
                 curr_stocks = set(top_group[top_group['date'] == curr_date]['stock_code'])
                 turnover_stocks = prev_stocks.symmetric_difference(curr_stocks)
                 if len(curr_stocks) > 0:
-                    turnover_rate = len(turnover_stocks) / (2 * len(prev_stocks))
+                    turnover_rate = len(turnover_stocks) / (2 * max(len(curr_stocks),len(prev_stocks)))
+                    if turnover_rate > 1:
+                        print(curr_date, len(turnover_stocks), len(prev_stocks),len(curr_stocks))
                     turnover_ts[curr_date] = turnover_rate
                 else:
                     turnover_ts[curr_date] = 0.0
@@ -736,9 +806,7 @@ def factor_backtest(df: pd.DataFrame,
             mean_ic = yearly_data['IC'].mean()
             icir = mean_ic / yearly_data['IC'].std() if yearly_data['IC'].std() != 0 else np.nan
             daily_returns = yearly_data[5]
-            mean_ret = daily_returns.mean()
-            annual_vol = daily_returns.std() * np.sqrt(252)
-            sharpe = mean_ret * 252 / annual_vol if annual_vol != 0 else np.nan
+            sharpe = (daily_returns.mean() * 252 - 0.03) / (daily_returns.std() * np.sqrt(252))
             cum_returns = (1 + daily_returns).cumprod()
             drawdowns = (cum_returns - cum_returns.cummax()) / cum_returns.cummax()
             mdd = drawdowns.min() if not drawdowns.empty else np.nan
@@ -747,21 +815,26 @@ def factor_backtest(df: pd.DataFrame,
             results['turnover'].append(turnover)
             results['mean_ic'].append(mean_ic)
             results['icir'].append(icir)
-            results['long_ret'].append(mean_ret)
+            results['long_ret'].append(daily_returns.mean())
             results['long_sharpe'].append(sharpe)
             results['long_mdd'].append(mdd)
 
+        # results['year'].append('avg')
+        # results['turnover'].append(result.turnover)
+        # results['mean_ic'].append(result.IC)
+        # results['icir'].append(result.ICIR)
+        # results['long_mdd'].append(result['Long Max Drawdown'])
+        # results['long_sharpe'].append(result['Long Sharpe'])
+        # results['long_ret'].append(sum(results['long_ret']) / len(results['long_ret']))
         results_df = pd.DataFrame(results)
         results_df = results_df.round(4)
-        results_df = results_df.sort_values('year')
 
         table_data = results_df.values
         col_labels = ['Year', 'Turnover', 'Mean IC', 'ICIR', 'Long Ret', 'Long Sharpe', 'Long MDD']
         formatted_data = []
         for row in table_data:
-            formatted_row = [f"{int(row[0]):d}"] + [f"{x:.4f}" if not np.isnan(x) else 'NaN' for x in row[1:]]
+            formatted_row = [f"{int(row[0]):d}"] + [f"{x:.4f}" if not np.isnan(x) else 'NaN' for x in row[1:]]            
             formatted_data.append(formatted_row)
-
         table = ax9.table(cellText=formatted_data,
                         colLabels=col_labels,
                         cellLoc='center',
@@ -773,7 +846,66 @@ def factor_backtest(df: pd.DataFrame,
         table.scale(1.2, 1.2)  
         ax9.set_title('Annual Portfolio Metrics', fontsize=15, pad=20)
 
-        # 调整布局
+       
+##################################### 子图 10: barra风格暴露 #####################################
+        ax10 = fig.add_subplot(gs[5, :])  
+        # ax10.axis('off')
+
+        barra_factors = [
+            'size', 'beta', 'momentum', 'residual_volatility', 'non_linear_size',
+            'book_to_price_ratio', 'liquidity', 'earnings_yield', 'growth', 'leverage'
+        ]
+
+        # 存储每日因子收益（暴露系数）
+        daily_factor_returns = {}
+        # 遍历每个日期进行截面回归
+        for date in tqdm(df['date'].unique(), desc='Process: 因子barra风格暴露分析...'):
+            subset_df = df[df['date'] == date].copy()
+
+            # 因变量 (Y): 股票的因子值 (这里假设为股票收益率或你希望归因的“factor”值)
+            Y = subset_df[factor_name]
+
+            # 自变量 (X): Barra的10个因子
+            X = subset_df[barra_factors]
+
+            # 添加截距项
+            X = sm.add_constant(X)
+
+            # 运行 OLS 回归
+            try:
+                model = sm.OLS(Y, X, missing='drop') # 处理缺失值
+                results = model.fit()
+
+                # 提取因子收益（回归系数）
+                # 第一个系数是常数项，我们关注的是后面10个因子
+                factor_returns_for_date = results.params[1:].to_dict()
+                daily_factor_returns[date] = factor_returns_for_date
+            except Exception as e:
+                print(f"Error processing date {date}: {e}")
+                # 如果回归失败，可以填充NaN或跳过
+                daily_factor_returns[date] = {factor: np.nan for factor in barra_factors}
+        
+        # 将每日因子收益转换为DataFrame
+        factor_returns_df = pd.DataFrame.from_dict(daily_factor_returns, orient='index')
+        factor_returns_df.index.name = 'date'
+        factor_returns_df = factor_returns_df.sort_index()
+        # 绘制因子收益（暴露系数）图在 ax10 子图上
+        sns.set_style("whitegrid")
+
+        for column in barra_factors:
+            ax10.plot(factor_returns_df.index, factor_returns_df[column], label=column)
+
+        # 添加水平线
+        ax10.axhline(y=0.2, color='black', linestyle='--', linewidth=2, label='0.2')
+        ax10.axhline(y=-0.2, color='black', linestyle='--', linewidth=2)
+
+        ax10.set_title('Barra Factor Exposure', fontsize=16)
+        ax10.set_xlabel('Date', fontsize=12)
+        ax10.set_ylabel('Daily Factor Return', fontsize=12)
+        ax10.legend(bbox_to_anchor=(0.5, -0.15), loc='upper center', ncol=5)
+        ax10.grid(True, linestyle='--', alpha=0.7)
+
+         # 调整布局
         print('Finished')
         fig.tight_layout(rect=[0, 0, 1, 0.98])
         plt.show()
@@ -787,10 +919,19 @@ def factor_backtest(df: pd.DataFrame,
     result, group_returns, ic = backtest(merge_df, 
                                         factor_name=factor_name, 
                                         num_groups=group, 
-                                        lag_days=lag_days, 
-                                        direction=direction)
+                                        direction=direction,
+                                        ret_mode = ret_mode,
+                                        pool = pool)
+    
     # 绘制所有图表
-    result = plot_all_charts(result, group_returns, ic, merge_df, factor_name, group)
+    result = plot_all_charts(result = result, 
+                             group_returns = group_returns, 
+                             ic = ic, 
+                             df = merge_df, 
+                             factor_name = factor_name, 
+                             num_groups = group, 
+                             ret_mode=ret_mode, 
+                             pool=pool)
 
     # 打印绩效表格
     result_transposed = result.T.reset_index()
